@@ -8,14 +8,18 @@
  * dependency-free, so the same module can be used everywhere.
  */
 
+import { isFormulaLine, normalizeTex } from "./slideMath";
+
 /** A piece of text with one inline style applied. */
 export interface SlideRun {
   text: string;
   bold?: boolean;
   italic?: boolean;
   code?: boolean;
-  /** Inline formula, already turned into readable Unicode. */
+  /** Inline formula: `text` is the readable fallback, `tex` the source. */
   math?: boolean;
+  /** The formula itself; the renderer typesets it instead of printing it. */
+  tex?: string;
 }
 
 export interface SlideListItem {
@@ -34,6 +38,8 @@ export type SlideBlock =
   | { type: "quote"; runs: SlideRun[] }
   /** A description of a picture that cannot be redrawn: shown as a panel. */
   | { type: "figure"; runs: SlideRun[] }
+  /** A display formula: typeset, not printed as its LaTeX source. */
+  | { type: "formula"; tex: string }
   | { type: "rule" };
 
 export type SlideSectionKind = "text" | "code" | "table" | "formula" | "figure" | "other";
@@ -235,6 +241,14 @@ export function parseSlideMarkdown(markdown: string): SlideModel {
       continue;
     }
 
+    const formula = readFormula(lines, i);
+    if (formula) {
+      flush();
+      ensureSection().blocks.push({ type: "formula", tex: formula.tex });
+      i = formula.end;
+      continue;
+    }
+
     paragraph.push(line.trim());
   }
 
@@ -256,6 +270,85 @@ export function parseSlideMarkdown(markdown: string): SlideModel {
     empty: blocks === 0 && !meaningfulTitle,
   };
 }
+
+/**
+ * Reads the display formula that starts on this line, if there is one.
+ *
+ * A formula reaches the parser either with its delimiters (`$$…$$`, `\[…\]`,
+ * `$…$`) or with nothing but its commands: the transcriber often writes one
+ * formula per line, and a line that is only LaTeX is display math. `\begin`
+ * blocks can run over several lines, so they are collected until their
+ * `\end`.
+ */
+function readFormula(lines: string[], start: number): { tex: string; end: number } | null {
+  const first = lines[start].trim();
+  if (first.length === 0) return null;
+
+  if (first.startsWith("$$")) return readDelimitedFormula(lines, start, "$$", "$$");
+  if (first.startsWith("\\[")) return readDelimitedFormula(lines, start, "\\[", "\\]");
+
+  const inline = /^\\\((.+)\\\)$/.exec(first);
+  if (inline) return { tex: inline[1].trim(), end: start };
+
+  // A whole line in single dollars is display math, not a word in a sentence.
+  const single = /^\$([^$]+)\$$/.exec(first);
+  if (single) return { tex: single[1].trim(), end: start };
+
+  const begin = /^\\begin\{([^}]+)\}/.exec(first);
+  if (begin) {
+    const environment = begin[1];
+    const body = [first];
+    let depth = environmentDepth(first, environment);
+    let end = start;
+
+    while (depth > 0 && end + 1 < lines.length && end - start < 24) {
+      end += 1;
+      body.push(lines[end].trim());
+      depth += environmentDepth(lines[end], environment);
+    }
+
+    return { tex: body.join(" "), end };
+  }
+
+  if (isFormulaLine(first)) return { tex: normalizeTex(first), end: start };
+  return null;
+}
+
+/** A block that opens with a delimiter and closes on the same or a later line. */
+function readDelimitedFormula(
+  lines: string[],
+  start: number,
+  open: string,
+  close: string,
+): { tex: string; end: number } | null {
+  const first = lines[start].trim();
+  const rest = first.slice(open.length);
+  const inline = rest.indexOf(close);
+  if (inline >= 0) return { tex: rest.slice(0, inline).trim(), end: start };
+
+  const body = [rest];
+  for (let end = start + 1; end < lines.length && end - start <= 12; end += 1) {
+    const line = lines[end];
+    const at = line.indexOf(close);
+    if (at >= 0) {
+      body.push(line.slice(0, at));
+      return { tex: body.join(" ").trim(), end };
+    }
+    body.push(line.trim());
+  }
+
+  // Never swallow the rest of the slide because one delimiter is missing.
+  return null;
+}
+
+function environmentDepth(line: string, environment: string): number {
+  return occurrences(line, `\\begin{${environment}}`) - occurrences(line, `\\end{${environment}}`);
+}
+
+function occurrences(text: string, part: string): number {
+  return text.split(part).length - 1;
+}
+
 
 function kindOfHeading(heading: string): SlideSectionKind {
   const text = heading.toLowerCase();
@@ -321,6 +414,17 @@ export function parseInline(input: string): SlideRun[] {
   while (i < input.length) {
     const char = input[i];
 
+    if (char === "\\" && input[i + 1] === "(") {
+      const end = input.indexOf("\\)", i + 2);
+      if (end > i + 2) {
+        flush();
+        const tex = input.slice(i + 2, end);
+        push({ text: simplifyMath(tex), math: true, tex });
+        i = end + 2;
+        continue;
+      }
+    }
+
     if (char === "\\" && i + 1 < input.length) {
       buffer += input[i + 1];
       i += 2;
@@ -368,7 +472,8 @@ export function parseInline(input: string): SlideRun[] {
       const end = input.indexOf("$", i + 1);
       if (end > i + 1) {
         flush();
-        push({ text: simplifyMath(input.slice(i + 1, end)), math: true });
+        const tex = input.slice(i + 1, end);
+        push({ text: simplifyMath(tex), math: true, tex });
         i = end + 1;
         continue;
       }

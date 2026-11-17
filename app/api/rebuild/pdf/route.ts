@@ -48,6 +48,7 @@ export async function POST(request: NextRequest) {
       const rendered = await renderSlide(slide.markdown, {
         index: slide.index,
         figures: slide.figures,
+        crops: slide.figureCrops,
         source: slide.source,
         deadline: slideDeadline(figuresDeadline, slides.length - offset),
       });

@@ -14,8 +14,15 @@ import type {
   SlideRun,
   SlideSection,
 } from "./slideMarkdown";
-import { boxToRect, freeAreaFor, type SlideFigure, type SlideRect } from "./slideFigures";
+import {
+  boxToRect,
+  freeAreaFor,
+  type FigureBox,
+  type SlideFigure,
+  type SlideRect,
+} from "./slideFigures";
 import { COLORS, FONTS, SLIDE_HEIGHT, SLIDE_WIDTH } from "./slideTheme";
+import { drawMath, layoutMath } from "./slideMath";
 
 type RasterContext = import("@napi-rs/canvas").SKRSContext2D;
 type RasterImage = import("@napi-rs/canvas").Image;
@@ -33,7 +40,9 @@ export type SlideCommand =
       stroke?: string;
       radius?: number;
     }
-  | { kind: "line"; x1: number; y1: number; x2: number; y2: number; color: string; width: number };
+  | { kind: "line"; x1: number; y1: number; x2: number; y2: number; color: string; width: number }
+  /** A formula: `y` is its baseline, `x` its left end. */
+  | { kind: "math"; x: number; y: number; tex: string; size: number; color: string };
 
 export interface SlideLayout {
   commands: SlideCommand[];
@@ -75,7 +84,10 @@ export function figureFrame(): SlideRect {
   };
 }
 
-/** Pictures smaller than this cannot be redrawn recognisably. */
+/**
+ * A picture smaller than this is grown once, before the layout, so the model is
+ * not asked to draw a 40-pixel thumbnail; the budget may still shrink it later.
+ */
 const MIN_FIGURE_SIDE = 130;
 /**
  * Share of the frame the pictures may take. The rest is text: without this a
@@ -96,17 +108,32 @@ export const TIGHT_FIGURE_BUDGET = 0.3;
  * Two corrections are applied: the pictures share a budget of the frame, and
  * they are shrunk away from each other, so that a model reporting slightly
  * overlapping boxes does not stack two drawings one on top of the other.
+ *
+ * `topLimit` keeps the pictures under the title: an element that reaches into
+ * the top of the original slide is pushed down instead of being drawn over the
+ * heading, which is what made the same deck look different from slide to slide.
  */
 export function placeFigures(
   figures: SlideFigure[],
   budgetShare: number = FIGURE_BUDGET,
+  topLimit: number = FRAME.top,
 ): PlacedFigure[] {
-  const frame = figureFrame();
+  const whole = figureFrame();
+  const top = Math.max(whole.y, Math.round(topLimit));
+  const frame: SlideRect = {
+    x: whole.x,
+    y: top,
+    width: whole.width,
+    height: Math.max(1, whole.y + whole.height - top),
+  };
   const placed: PlacedFigure[] = [];
   let budget = frame.width * frame.height * budgetShare;
 
   for (const figure of figures) {
-    let rect = boxToRect(figure.box, frame);
+    // The box is read against the whole slide area, so an element keeps its
+    // proportion of the page; only what falls inside the free band is used.
+    const target = clipTo(keepAspect(boxToRect(figure.box, whole), figure.box), frame);
+    let rect = atLeastMinSide(target, frame);
     const area = rect.width * rect.height;
 
     if (area > budget && area > 0) {
@@ -121,12 +148,84 @@ export function placeFigures(
   return placed;
 }
 
+/** The part of `rect` that falls inside `frame`, sliding it back when needed. */
+function clipTo(rect: SlideRect, frame: SlideRect): SlideRect {
+  const width = Math.max(1, Math.min(rect.width, frame.width));
+  const height = Math.max(1, Math.min(rect.height, frame.height));
+  const x = Math.min(Math.max(rect.x, frame.x), frame.x + frame.width - width);
+  const y = Math.min(Math.max(rect.y, frame.y), frame.y + frame.height - height);
+
+  return { x: Math.round(x), y: Math.round(y), width: Math.round(width), height: Math.round(height) };
+}
+
+/**
+ * The same rectangle, with the aspect ratio the element had on the slide.
+ *
+ * The frame is not the same shape as a slide (1640×783 against 1920×1080), so
+ * mapping a fraction of the slide into the frame stretches every picture
+ * horizontally: a compact table becomes a wide strip, and the model is then
+ * asked to draw a wide strip. Fitting the original aspect inside the reserved
+ * area keeps a table a table; the freed space goes back to the text.
+ */
+function keepAspect(rect: SlideRect, box: FigureBox): SlideRect {
+  const sourceWidth = box.width * SLIDE_WIDTH;
+  const sourceHeight = box.height * SLIDE_HEIGHT;
+  if (sourceWidth <= 0 || sourceHeight <= 0) return rect;
+
+  const aspect = sourceWidth / sourceHeight;
+  let width = rect.width;
+  let height = width / aspect;
+
+  if (height > rect.height) {
+    height = rect.height;
+    width = height * aspect;
+  }
+
+  return {
+    x: Math.round(rect.x + (rect.width - width) / 2),
+    y: Math.round(rect.y + (rect.height - height) / 2),
+    width: Math.max(1, Math.round(width)),
+    height: Math.max(1, Math.round(height)),
+  };
+}
+
+/**
+ * Grows a rectangle uniformly until its smaller side reaches the minimum.
+ *
+ * The floor belongs here, once, and not in `scaleRect`: enforcing it on each
+ * dimension separately is what turned a wide, short table into a wide, tall
+ * one whenever the layout had to shrink it.
+ */
+function atLeastMinSide(rect: SlideRect, frame: SlideRect): SlideRect {
+  const smaller = Math.min(rect.width, rect.height);
+  if (smaller >= MIN_FIGURE_SIDE) return rect;
+
+  const fit = Math.min(frame.width / Math.max(1, rect.width), frame.height / Math.max(1, rect.height));
+  const scale = Math.min(MIN_FIGURE_SIDE / Math.max(1, smaller), Math.max(1, fit));
+  const width = Math.round(rect.width * scale);
+  const height = Math.round(rect.height * scale);
+
+  return {
+    x: Math.round(
+      Math.max(frame.x, Math.min(rect.x - (width - rect.width) / 2, frame.x + frame.width - width)),
+    ),
+    y: Math.round(
+      Math.max(
+        frame.y,
+        Math.min(rect.y - (height - rect.height) / 2, frame.y + frame.height - height),
+      ),
+    ),
+    width,
+    height,
+  };
+}
+
 function scaleRect(rect: SlideRect, factor: number): SlideRect {
   return {
     x: rect.x,
     y: rect.y,
-    width: Math.max(MIN_FIGURE_SIDE, Math.round(rect.width * factor)),
-    height: Math.max(MIN_FIGURE_SIDE, Math.round(rect.height * factor)),
+    width: Math.max(1, Math.round(rect.width * factor)),
+    height: Math.max(1, Math.round(rect.height * factor)),
   };
 }
 
@@ -207,9 +306,11 @@ interface Token {
   color: string;
   width: number;
   space: boolean;
+  /** A formula: how wide it is and how far it reaches from the baseline. */
+  math?: { tex: string; size: number; ascent: number; descent: number };
 }
 
-function measure(context: RasterContext, token: Omit<Token, "width">): number {
+function measure(context: RasterContext, token: Omit<Token, "width" | "math">): number {
   context.font = token.font;
   return context.measureText(token.text).width;
 }
@@ -219,6 +320,19 @@ function tokenize(context: RasterContext, runs: SlideRun[], size: number, color:
   const tokens: Token[] = [];
 
   runs.forEach((run, runIndex) => {
+    if (run.tex) {
+      const layout = layoutMath(context, run.tex, size);
+      tokens.push({
+        text: run.text,
+        font: fontFor(size, runStyle(run)),
+        color,
+        width: layout.width,
+        space: false,
+        math: { tex: run.tex, size, ascent: layout.ascent, descent: layout.descent },
+      });
+      return;
+    }
+
     const font = fontFor(run.code ? Math.round(size * 0.92) : size, runStyle(run));
     const runColor = run.code ? COLORS.steel : color;
     const parts = run.text.split(/(\s+)/);
@@ -239,6 +353,7 @@ function tokenize(context: RasterContext, runs: SlideRun[], size: number, color:
     const next = runs[runIndex + 1];
     if (
       next &&
+      !next.tex &&
       !/\s$/.test(run.text) &&
       !/^\s/.test(next.text) &&
       /[\w.,;:!?)\]}%]$/.test(run.text) &&
@@ -290,27 +405,72 @@ function wrapTokens(tokens: Token[], maxWidth: number): Token[][] {
   return lines;
 }
 
-/** Text commands for a wrapped paragraph starting at (x, y). */
-function textCommands(lines: Token[][], x: number, y: number, lineHeight: number): SlideCommand[] {
+/**
+ * Text commands for wrapped lines starting at (x, y).
+ *
+ * A line that carries a formula is taller than a line of text: the fraction
+ * reaches above the text's own ascent, so the line is pushed down by that much
+ * and the next one starts below the deepest formula. The formulas and the words
+ * share the same baseline, which is what makes `x = \frac{a}{b}` read as one
+ * sentence instead of a picture glued next to a word.
+ */
+function textCommands(
+  context: RasterContext,
+  lines: Token[][],
+  x: number,
+  y: number,
+  lineHeight: number,
+  size: number,
+): { commands: SlideCommand[]; height: number } {
   const commands: SlideCommand[] = [];
 
-  lines.forEach((line, index) => {
-    let cursor = x;
+  context.font = fontFor(size);
+  const probe = context.measureText("Hxgy");
+  const textAscent = probe.actualBoundingBoxAscent > 0 ? probe.actualBoundingBoxAscent : size * 0.74;
+  const textDescent = probe.actualBoundingBoxDescent > 0 ? probe.actualBoundingBoxDescent : size * 0.22;
+
+  let cursor = y;
+
+  for (const line of lines) {
+    let above = 0;
+    let below = 0;
 
     for (const token of line) {
-      commands.push({
-        kind: "text",
-        x: cursor,
-        y: y + index * lineHeight,
-        text: token.text,
-        font: token.font,
-        color: token.color,
-      });
-      cursor += token.width;
+      if (!token.math) continue;
+      above = Math.max(above, token.math.ascent - textAscent);
+      below = Math.max(below, token.math.descent - textDescent);
     }
-  });
 
-  return commands;
+    const top = cursor + above;
+    let column = x;
+
+    for (const token of line) {
+      if (token.math) {
+        commands.push({
+          kind: "math",
+          x: column,
+          y: top + textAscent,
+          tex: token.math.tex,
+          size: token.math.size,
+          color: token.color,
+        });
+      } else {
+        commands.push({
+          kind: "text",
+          x: column,
+          y: top,
+          text: token.text,
+          font: token.font,
+          color: token.color,
+        });
+      }
+      column += token.width;
+    }
+
+    cursor += lineHeight + above + below;
+  }
+
+  return { commands, height: cursor - y };
 }
 
 function ellipsize(context: RasterContext, text: string, font: string, maxWidth: number): string {
@@ -340,10 +500,49 @@ function planParagraph(
 ): Planned {
   const tokens = tokenize(context, runs, metrics.body, color);
   const lines = wrapTokens(tokens, width);
+  const text = textCommands(context, lines, x, y, metrics.bodyLine, metrics.body);
+
+  return { commands: text.commands, height: text.height };
+}
+
+/**
+ * A display formula, centred in the column it belongs to.
+ *
+ * It is set a little larger than the body text (the source slides do the same)
+ * and shrunk only when it would not fit the column, so a long expression never
+ * runs under a picture or off the slide.
+ */
+function planFormula(
+  context: RasterContext,
+  tex: string,
+  x: number,
+  y: number,
+  width: number,
+  metrics: Metrics,
+): Planned {
+  let size = Math.max(14, Math.round(metrics.body * 1.12));
+  let formula = layoutMath(context, tex, size);
+
+  while (formula.width > width && size > 13) {
+    size = Math.max(13, size - 2);
+    formula = layoutMath(context, tex, size);
+  }
+
+  const padding = Math.round(size * 0.3);
+  const left = x + Math.max(0, (width - formula.width) / 2);
 
   return {
-    commands: textCommands(lines, x, y, metrics.bodyLine),
-    height: lines.length * metrics.bodyLine,
+    commands: [
+      {
+        kind: "math",
+        x: left,
+        y: y + padding + formula.ascent,
+        tex,
+        size,
+        color: COLORS.ink,
+      },
+    ],
+    height: formula.ascent + formula.descent + padding * 2,
   };
 }
 
@@ -762,6 +961,8 @@ function planBlock(
       return planQuote(context, block.runs, x, y, width, metrics);
     case "figure":
       return planFigure(context, block.runs, x, y, width, metrics);
+    case "formula":
+      return planFormula(context, block.tex, x, y, width, metrics);
     case "rule":
       return planRule(x, y, width);
     default:
@@ -785,9 +986,10 @@ function planSection(
     const runs = section.heading.map((run) => ({ ...run, bold: true }));
     const tokens = tokenize(context, runs, metrics.heading, COLORS.steel);
     const lines = wrapTokens(tokens, width).slice(0, 2);
+    const placed = textCommands(context, lines, x, cursor, metrics.headingLine, metrics.heading);
 
-    commands.push(...textCommands(lines, x, cursor, metrics.headingLine));
-    cursor += lines.length * metrics.headingLine + Math.round(metrics.heading * 0.3);
+    commands.push(...placed.commands);
+    cursor += placed.height + Math.round(metrics.heading * 0.3);
 
     const ruleHeight = Math.max(2, Math.round(metrics.heading * 0.12));
     commands.push({
@@ -893,11 +1095,11 @@ function planTitle(
   }
 
   const lineHeight = Math.round(size * TITLE_LINE);
-  const commands = textCommands(lines, x, y, lineHeight);
-  const ruleY = y + lines.length * lineHeight + Math.round(size * 0.3);
+  const placed = textCommands(context, lines, x, y, lineHeight, size);
+  const ruleY = y + placed.height + Math.round(size * 0.3);
   const ruleHeight = Math.max(3, Math.round(size * 0.1));
 
-  commands.push({
+  placed.commands.push({
     kind: "rect",
     x,
     y: ruleY,
@@ -907,7 +1109,7 @@ function planTitle(
     radius: ruleHeight / 2,
   });
 
-  return { commands, height: ruleY + ruleHeight - y };
+  return { commands: placed.commands, height: ruleY + ruleHeight - y };
 }
 
 function splitSections(
@@ -939,17 +1141,61 @@ function splitSections(
 
 function blockGap(block: SlideBlock, metrics: Metrics): number {
   const base = Math.round(BLOCK_GAP * (metrics.body / 30));
-  return block.type === "code" || block.type === "table" ? Math.round(base * 1.35) : base;
+  return block.type === "code" || block.type === "table" || block.type === "formula"
+    ? Math.round(base * 1.35)
+    : base;
 }
 
+
+/** Everything below the title belongs to the content; the title never moves. */
+const TITLE_GAP = 30;
+/** The type sizes tried, largest first. The title is not part of the search. */
+const SCALES = [1, 0.94, 0.88, 0.82, 0.76, 0.7, 0.64];
+
+/** Runs of the title, with the fallback used when a slide has none. */
+function titleRunsFor(model: SlideModel, fallbackTitle: string): SlideRun[] {
+  return model.title.length > 0 ? model.title : [{ text: fallbackTitle }];
+}
+
+/** A title, always at the same size in the same place, on every slide. */
+function planFixedTitle(
+  context: RasterContext,
+  model: SlideModel,
+  fallbackTitle: string,
+): Planned {
+  const frame = figureFrame();
+  const metrics = metricsFor(1);
+  return planTitle(context, titleRunsFor(model, fallbackTitle), frame.x, frame.y, frame.width, {
+    ...metrics,
+    title: TITLE_SIZE,
+    titleLine: Math.round(TITLE_SIZE * TITLE_LINE),
+  });
+}
+
+/**
+ * The line under which the content of every slide starts.
+ *
+ * All slides share the same title block, so a reader flipping through the deck
+ * finds the first line of text at the same height even when the titles differ
+ * in length; pictures are kept under this line too.
+ */
+export function contentTopFor(
+  context: RasterContext,
+  model: SlideModel,
+  fallbackTitle: string,
+): number {
+  const plan = planFixedTitle(context, model, fallbackTitle);
+  return figureFrame().y + plan.height + TITLE_GAP;
+}
 
 /**
  * Plans one slide: title on top, then the sections, in one column when they
  * fit and in two when they do not. Type size steps down until everything fits.
  *
- * The figures keep the area they had on the original slide; the text is planned
- * in the largest band that is left, so a picture on the left pushes the text to
- * the right instead of being buried under it.
+ * The figures keep the area they had on the original slide, but never climb
+ * into the title; the text is planned in the largest band that is left, so a
+ * picture on the left pushes the text to the right instead of being buried
+ * under it.
  */
 export function planSlide(
   context: RasterContext,
@@ -957,39 +1203,31 @@ export function planSlide(
   fallbackTitle: string,
   figures: PlacedFigure[] = [],
 ): SlideLayout {
+  const wholeFrame = figureFrame();
+  const title = planFixedTitle(context, model, fallbackTitle);
+  const top = wholeFrame.y + title.height + TITLE_GAP;
   const frame = freeAreaFor(
-    figureFrame(),
+    { ...wholeFrame, y: top, height: wholeFrame.y + wholeFrame.height - top },
     figures.map((entry) => entry.rect),
   );
-  const titleRuns: SlideRun[] = model.title.length > 0 ? model.title : [{ text: fallbackTitle }];
-  // Sparse slides are typeset larger so they do not look lost in the frame;
-  // dense ones step down until everything fits.
-  const scales = [1.15, 1.06, 0.98, 0.92, 0.86, 0.8, 0.74, 0.68];
   const columnWidth = Math.round((frame.width - COLUMN_GAP) / 2);
   const limit = frame.y + frame.height;
 
   const attempt = (scale: number, cut: number) => {
     const metrics = metricsFor(scale);
-    const titleScale = Math.min(scale, 1.04);
-    const title = planTitle(context, titleRuns, frame.x, frame.y, frame.width, {
-      ...metrics,
-      title: Math.round(TITLE_SIZE * titleScale),
-      titleLine: Math.round(TITLE_SIZE * TITLE_LINE * titleScale),
-    });
-    const top = frame.y + title.height + Math.round(metrics.body * 1.5);
-    const available = frame.height - (top - frame.y);
+    const available = frame.height;
 
-    const single = planSections(context, model.sections, frame.x, top, frame.width, metrics, cut);
+    const single = planSections(context, model.sections, frame.x, frame.y, frame.width, metrics, cut);
 
     let columns: { commands: SlideCommand[]; height: number } | null = null;
     if (model.sections.length >= 2) {
       const [first, second] = splitSections(context, model.sections, columnWidth, metrics);
-      const left = planSections(context, first, frame.x, top, columnWidth, metrics, cut);
+      const left = planSections(context, first, frame.x, frame.y, columnWidth, metrics, cut);
       const right = planSections(
         context,
         second,
         frame.x + columnWidth + COLUMN_GAP,
-        top,
+        frame.y,
         columnWidth,
         metrics,
         cut,
@@ -1008,7 +1246,7 @@ export function planSlide(
     };
   };
 
-  for (const scale of scales) {
+  for (const scale of SCALES) {
     const planned = attempt(scale, Number.POSITIVE_INFINITY);
 
     if (planned.single.height <= planned.available) {
@@ -1034,7 +1272,7 @@ export function planSlide(
 
   // Nothing fits: smallest type, and whole blocks are dropped at the frame edge
   // instead of being cut in half.
-  const final = attempt(scales[scales.length - 1], limit);
+  const final = attempt(SCALES[SCALES.length - 1], limit);
 
   return {
     commands: (final.columns ?? final.single).commands,
@@ -1076,8 +1314,12 @@ export function drawLayout(context: RasterContext, layout: SlideLayout): void {
 
   context.save();
   context.textBaseline = "top";
+  // The title lives above the content frame, so the clip is the whole free
+  // area of the template: what gets cut is what falls off the slide, not what
+  // sits above the first line of the transcription.
+  const clip = figureFrame();
   context.beginPath();
-  context.rect(layout.frame.x, layout.frame.y, layout.frame.width, layout.frame.height);
+  context.rect(clip.x, clip.y, clip.width, clip.height);
   context.clip();
 
   for (const command of layout.commands) {
@@ -1118,6 +1360,12 @@ export function drawLayout(context: RasterContext, layout: SlideLayout): void {
         context.stroke();
         context.restore();
         break;
+
+      case "math": {
+        const formula = layoutMath(context, command.tex, command.size);
+        drawMath(context, formula, command.x, command.y, command.color);
+        break;
+      }
 
       default:
         break;

@@ -8,6 +8,7 @@ import { collectLayoutFindings, renderLayoutMarkdown } from "@/lib/layoutSummary
 import { openPdfPages } from "@/lib/pdfPages";
 import type { PageImage, PdfPages } from "@/lib/pdfPages";
 import { convertPptxToPdf } from "@/lib/pptxToPdf";
+import { expandBox, inflateBox, unionBoxes } from "@/lib/slideFigures";
 import {
   checkModelBalance,
   DescriberError,
@@ -273,6 +274,57 @@ async function transcribePages(input: TranscribeInput): Promise<void> {
           layout: description.layout,
           usedAI: description.usedAI,
         };
+
+        // Each figure travels to the rebuild with its own picture and, when the
+        // document has a text layer, with its exact texts. Rendering the figure
+        // again from the vector page is what makes a table or a code panel
+        // readable: inside the page raster it would be a hundred pixels wide.
+        if (description.figures.length > 0) {
+          const figureCrops: Record<string, string> = {};
+          let cropChars = 0;
+
+          for (const figure of description.figures) {
+            // The reported area is a little tight: it is widened once, here,
+            // and that box is the one the rebuild will use, so crop, layout
+            // and review all look at exactly the same rectangle.
+            let box = expandBox(figure.box);
+            figure.box = box;
+
+            try {
+              // Look for text a little outside the box too: the header of a
+              // table often sits just above the area the model drew. When the
+              // document has a text layer, its bounds refine the box; a table
+              // is defined by its text, so for a table they replace it.
+              const probe = inflateBox(box, 0.035);
+              const texts = await page.textsIn(probe);
+              const bounds = await page.textBoundsIn(probe);
+
+              if (bounds) {
+                box =
+                  figure.kind === "table"
+                    ? expandBox(bounds, 0.04)
+                    : expandBox(unionBoxes(box, bounds), 0.02);
+                figure.box = box;
+              }
+
+              if (texts.length > 0) figure.verbatim = texts;
+
+              const crop = await page.crop(box);
+              if (crop && cropChars + crop.length <= 2_400_000) {
+                figureCrops[figure.id] = crop;
+                cropChars += crop.length;
+              }
+            } catch (error) {
+              console.warn(
+                `Slide ${pageNumber}, figure ${figure.id}: the element could not be prepared (${
+                  error instanceof Error ? error.message : "unknown error"
+                }).`,
+              );
+            }
+          }
+
+          if (Object.keys(figureCrops).length > 0) slide.figureCrops = figureCrops;
+        }
 
         slides.push(slide);
         send({ type: "slide", slide });

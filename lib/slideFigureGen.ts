@@ -2,6 +2,7 @@ import OpenAI from "openai";
 import type { ChatCompletionContentPart } from "openai/resources/chat/completions";
 
 import type { PlacedFigure } from "./slideLayout";
+import { boxToRect, figureTexts } from "./slideFigures";
 import type { ReviewIssue, SlideFigure, SlideRect, SlideReview } from "./slideFigures";
 import { SLIDE_HEIGHT, SLIDE_WIDTH } from "./slideTheme";
 
@@ -50,7 +51,7 @@ const MAX_BRIEF_TOKENS = 8_000;
  * and both come out of the same budget: too small a cap truncates the answer in
  * the middle of the object, which loses a verdict that was already decided.
  */
-const MAX_VERDICT_TOKENS = 8_000;
+const MAX_VERDICT_TOKENS = 12_000;
 /**
  * A verdict is a short call and must never outlive the slide's slice: the
  * drawing is already on the canvas, so waiting for it is optional.
@@ -87,12 +88,15 @@ const REPAIR_RESERVE_MS = 60_000;
 const ROUND_RESERVE_MS = 45_000;
 /** Anything larger is a runaway answer, not a drawing. */
 const MAX_SVG_CHARS = 120_000;
+/**
+ * A drawing is quoted back to the model when it is repaired. Beyond this the
+ * prompt grows more than the repair is worth: the drawing is redone instead.
+ */
+const MAX_PREVIOUS_SVG_CHARS = 80_000;
 /** Two calls at a time: enough to hide the latency, gentle on rate limits. */
 const CONCURRENCY = 2;
 /** Bounded cache: the same figure redrawn twice is the same picture. */
 const CACHE_LIMIT = 120;
-/** Extra slide, as a fraction of the figure box, around the crop sent to the model. */
-const CROP_MARGIN = 0.06;
 /** The drawing is rasterised at twice the size it is shown at: small type stays crisp. */
 const RASTER_SCALE = 2;
 /** A drawing whose ink covers less than this is a blank canvas, not a figure. */
@@ -146,6 +150,20 @@ function quoted(values: string[]): string {
   return values.map((value) => JSON.stringify(value)).join(", ");
 }
 
+/** The texts of a figure, with the document's own strings when they exist. */
+function textsOf(figure: SlideFigure): string {
+  const texts = figureTexts(figure);
+
+  return texts.length > 0 ? quoted(texts) : "none";
+}
+
+/** How the texts are introduced: the document's are not a guess. */
+function textsLabel(figure: SlideFigure): string {
+  return figure.verbatim && figure.verbatim.length > 0
+    ? "Texts printed inside it, verbatim from the document, in reading order"
+    : "Texts printed inside it, in reading order";
+}
+
 function paletteOf(figure: SlideFigure, fallback: string): string {
   return figure.palette.length > 0 ? figure.palette.join(", ") : fallback;
 }
@@ -166,7 +184,7 @@ function buildBriefPrompt(
   width: number,
   height: number,
 ): string {
-  const labels = figure.labels.length > 0 ? quoted(figure.labels) : "none";
+  const labels = textsOf(figure);
 
   return [
     `This is the crop of one visual element of a slide: ${kindOf(figure)}.`,
@@ -181,7 +199,10 @@ function buildBriefPrompt(
     "- what overlaps what, and which part is on top.",
     "",
     `What the slide analysis said about it: ${figure.description}`,
-    `Texts printed inside it, in reading order: ${labels}`,
+    `${textsLabel(figure)}: ${labels}`,
+    ...(figure.verbatim && figure.verbatim.length > 0
+      ? ["Those texts come from the document itself: write them exactly, do not re-read or correct them."]
+      : []),
     `Dominant colours: ${paletteOf(figure, "as you see them")}`,
     "",
     "Answer in plain text, at most 400 words: no preamble, no conclusion, no comment on the slide.",
@@ -196,7 +217,7 @@ function drawRules(width: number, height: number): string[] {
     "RULES",
     `- The drawing is ${width}×${height} px, on a transparent background.`,
     `- Answer with <svg xmlns="http://www.w3.org/2000/svg" width="${width}" height="${height}" viewBox="0 0 ${width} ${height}"> … </svg> and nothing else: no markdown fence, no comment, no explanation.`,
-    "- Use the whole canvas: the element is drawn as large as it was on the slide, not squeezed into a corner.",
+    "- The crop is the whole area, including the empty space around the element: keep the element where it is and at the size it has, and do not enlarge it to fill the canvas.",
     "- Nothing is cut: every shape and every text stays at least 8 px inside the canvas.",
     "- Draw in layers, in this order: the background of the element, then its shapes, then its texts.",
     "- Nothing covers a text: every label sits on a clean area and is not overlapped by a bar, a line or a picture.",
@@ -205,6 +226,7 @@ function drawRules(width: number, height: number): string[] {
     "- No <script>, no <foreignObject>, no <image>, no CSS class, no @import, no external font.",
     '- Text: <text> elements with font-family="Arial" and a font-size large enough to read.',
     "- Keep every text exactly as printed: do not translate it, shorten it, correct it or drop it.",
+    "- Reproduce numbering and bullets exactly as printed: keep line numbers, do not renumber, and keep blank lines blank.",
     "- Respect the layout of the element: what is above stays above, what is on the right stays on the right.",
   ];
 }
@@ -215,6 +237,13 @@ export interface FigureRepair {
   problems: string[];
   /** What has to change, in the reviewer's words. */
   instructions: string;
+  /**
+   * The drawing the verdict was about, when it is small enough to quote back.
+   *
+   * A repair that sees the previous version edits it; a repair that does not
+   * sees only the complaint and starts again from a fresh, unrelated guess.
+   */
+  previous?: string;
 }
 
 /**
@@ -235,7 +264,7 @@ function buildDrawPrompt(
   brief: string | null,
   repair: FigureRepair | null = null,
 ): string {
-  const labels = figure.labels.length > 0 ? quoted(figure.labels) : "none";
+  const labels = textsOf(figure);
 
   return [
     repair
@@ -253,11 +282,26 @@ function buildDrawPrompt(
           "It was compared with the image and rejected.",
           ...repair.problems.map((problem) => `- ${problem}`),
           repair.instructions ? `What to change: ${repair.instructions}` : "",
-          "Draw the element again from the beginning and fix every one of these; keep what was already right.",
+          repair.previous
+            ? "YOUR PREVIOUS SVG"
+            : "Draw the element again from the beginning and fix every one of these; keep what was already right.",
+          ...(repair.previous
+            ? [
+                "<<<",
+                repair.previous,
+                ">>>",
+                "Return the complete corrected document. Keep every part that was right exactly as it is; change only what these problems require.",
+              ]
+            : []),
           "",
         ]
       : []),
-    `Texts printed inside it, verbatim, in reading order: ${labels}`,
+    `${textsLabel(figure)}: ${labels}`,
+    ...(figure.verbatim && figure.verbatim.length > 0
+      ? [
+          "Those strings are exact, taken from the document: use them as they are even if the description says otherwise.",
+        ]
+      : []),
     `Dominant colours: ${paletteOf(figure, "the colours you see")}`,
     "",
     ...drawRules(width, height),
@@ -280,10 +324,11 @@ function buildCritiquePrompt(
   height: number,
   round: number,
 ): string {
-  const labels = figure.labels.length > 0 ? quoted(figure.labels) : "none";
+  const labels = textsOf(figure);
 
   return [
-    `Two images follow. IMAGE 1 is ${kindOf(figure)} as it appears on the original slide. IMAGE 2 is the drawing sent to you for approval, ${width}×${height} px.`,
+    `Two images follow. IMAGE 1 is ${kindOf(figure)} as it appears on the original slide. IMAGE 2 is the drawing sent to you for approval, which will fill ${width}×${height} px on the rebuilt slide.`,
+    `Both images are ${PAIR_WIDTH} px wide and show the same area at the same scale: a difference in size or position between them is a real difference in the drawing, not a difference of framing. A hairline of margin around the drawing is not a problem.`,
     "Compare them as a reader of the slide would: same idea, same shapes, same texts, same proportions, same colours, same reading order.",
     "",
     "Look for, in this order:",
@@ -294,7 +339,7 @@ function buildCritiquePrompt(
     "- the overall likeness: would someone comparing the two pictures say they show the same element?",
     "",
     `The element is ${kindOf(figure)}. What the slide analysis said about it: ${figure.description}`,
-    `Texts printed inside it, verbatim, in reading order: ${labels}`,
+    `${textsLabel(figure)}: ${labels}`,
     `Dominant colours: ${paletteOf(figure, "as they appear in IMAGE 1")}`,
     round > 1
       ? "This is a repaired drawing: check that the previous problems are gone and that nothing new was broken."
@@ -381,14 +426,26 @@ function clamp(value: number, min: number, max: number): number {
 }
 
 /**
+ * Where one element sits on the original slide, in design pixels.
+ *
+ * This is the whole point of the crop: `box` is a fraction of the slide, while
+ * the layout's `rect` is the same element *after* it has been moved inside the
+ * template's frame. Cropping the source with the placed rect cuts the element
+ * off by the frame margin — and every drawing is then made from the wrong
+ * picture, so no amount of review can save it.
+ */
+export function figureSourceRect(figure: SlideFigure): SlideRect {
+  return boxToRect(figure.box, { x: 0, y: 0, width: SLIDE_WIDTH, height: SLIDE_HEIGHT });
+}
+
+/**
  * Cuts the picture of one element out of the slide raster.
  *
- * The crop is scaled up to a size the model can read: a figure that is a third
- * of a thumbnail would otherwise be a handful of blurry pixels. A small margin
- * is kept around the box, because titles and axis labels often sit a few pixels
- * outside the area the model reported.
+ * `rect` is the element on the original slide, not on the rebuilt one. The crop
+ * is scaled up to a size the model can read: a figure that is a third of a
+ * thumbnail would otherwise be a handful of blurry pixels.
  */
-async function cropToDataUrl(
+export async function cropToDataUrl(
   canvas: CanvasModule,
   source: RasterImage,
   rect: SlideRect,
@@ -396,19 +453,12 @@ async function cropToDataUrl(
   const scaleX = source.width / SLIDE_WIDTH;
   const scaleY = source.height / SLIDE_HEIGHT;
 
-  const padX = rect.width * CROP_MARGIN;
-  const padY = rect.height * CROP_MARGIN;
-  const left = Math.max(0, rect.x - padX);
-  const top = Math.max(0, rect.y - padY);
-  const right = Math.min(SLIDE_WIDTH, rect.x + rect.width + padX);
-  const bottom = Math.min(SLIDE_HEIGHT, rect.y + rect.height + padY);
+  const sourceX = clamp(Math.round(rect.x * scaleX), 0, Math.max(0, source.width - 1));
+  const sourceY = clamp(Math.round(rect.y * scaleY), 0, Math.max(0, source.height - 1));
+  const sourceWidth = clamp(Math.round(rect.width * scaleX), 1, source.width - sourceX);
+  const sourceHeight = clamp(Math.round(rect.height * scaleY), 1, source.height - sourceY);
 
-  const sourceX = clamp(Math.round(left * scaleX), 0, Math.max(0, source.width - 1));
-  const sourceY = clamp(Math.round(top * scaleY), 0, Math.max(0, source.height - 1));
-  const sourceWidth = clamp(Math.round((right - left) * scaleX), 1, source.width - sourceX);
-  const sourceHeight = clamp(Math.round((bottom - top) * scaleY), 1, source.height - sourceY);
-
-  const width = clamp(Math.round(sourceWidth * 1.6), 420, 1024);
+  const width = clamp(Math.round(sourceWidth * 1.6), 360, 1200);
   const height = Math.max(120, Math.round((sourceHeight * width) / sourceWidth));
 
   const raster = canvas.createCanvas(width, height);
@@ -460,6 +510,90 @@ async function toDataUrl(image: RasterCanvas, maxWidth: number): Promise<string>
   const jpeg = await target.encode("jpeg", 84);
 
   return `data:image/jpeg;base64,${jpeg.toString("base64")}`;
+}
+
+/**
+ * The picture the critic will see: exactly `width` px wide, whatever it was.
+ *
+ * The original and the drawing used to arrive at different sizes and with
+ * different margins, so the critic spent its judgement on the framing and
+ * reported proportions that were not wrong. Two copies of the same area, at the
+ * same width, leave it only the drawing to judge.
+ */
+async function pairImage(
+  canvas: CanvasModule,
+  source: RasterCanvas | string,
+  width: number,
+): Promise<string | null> {
+  const image =
+    typeof source === "string" ? await canvas.loadImage(source).catch(() => null) : source;
+  if (!image) return null;
+
+  const height = Math.max(1, Math.round((image.height * width) / Math.max(1, image.width)));
+  const target = canvas.createCanvas(width, height);
+  const context = target.getContext("2d") as RasterContext;
+
+  context.fillStyle = "#ffffff";
+  context.fillRect(0, 0, width, height);
+  context.imageSmoothingEnabled = true;
+  context.drawImage(image, 0, 0, width, height);
+
+  const jpeg = await target.encode("jpeg", 86);
+  return `data:image/jpeg;base64,${jpeg.toString("base64")}`;
+}
+
+/** A string reduced to letters and digits, for comparing printed text. */
+function textFingerprint(value: string): string {
+  return value
+    .replace(/&amp;/g, "&")
+    .replace(/&lt;/g, "<")
+    .replace(/&gt;/g, ">")
+    .replace(/&quot;/g, '"')
+    .replace(/&#0?39;|&apos;/g, "'")
+    .toLowerCase()
+    .replace(/[^\p{L}\p{N}]+/gu, "");
+}
+
+/** The text a drawing contains, with markup and entities out of the way. */
+function drawnText(svg: string): string {
+  return textFingerprint(
+    svg
+      .replace(/<title[\s\S]*?<\/title>/gi, " ")
+      .replace(/<desc[\s\S]*?<\/desc>/gi, " ")
+      .replace(/<[^>]*>/g, " "),
+  );
+}
+
+/**
+ * The strings of the document that never made it into the drawing.
+ *
+ * This is not the model's opinion: the strings come from the PDF's own text
+ * layer and the drawing is searched as text, so a table cell that was silently
+ * dropped is caught even when the critic is happy with the picture.
+ */
+function missingTexts(svg: string, texts: string[]): string[] {
+  const haystack = drawnText(svg);
+  if (!haystack) return texts.slice(0, 4);
+
+  const missing: string[] = [];
+
+  for (const text of texts) {
+    // A line is checked word by word: a table row may legitimately be drawn one
+    // column at a time, and requiring the whole row in reading order would
+    // reject a drawing that has every cell.
+    const words = text
+      .split(/\s+/)
+      .map(textFingerprint)
+      .filter((word) => word.length >= 2);
+
+    if (words.length > 0 && words.some((word) => !haystack.includes(word))) {
+      missing.push(text);
+    }
+
+    if (missing.length >= 4) break;
+  }
+
+  return missing;
 }
 
 /**
@@ -578,11 +712,13 @@ function frameSvg(svg: string, width: number, height: number): SvgFrame | null {
   const boxX = box ? box[0] : 0;
   const boxY = box ? box[1] : 0;
 
-  // A little room around the drawing: labels often sit right on the edge.
-  const viewWidth = boxWidth * 1.08;
-  const viewHeight = boxHeight * 1.08;
-  const viewX = boxX - boxWidth * 0.04;
-  const viewY = boxY - boxHeight * 0.04;
+  // A little room around the drawing: labels often sit right on the edge. It
+  // is deliberately small — the frame is fitted to the area reserved on the
+  // slide, so every point added here shrinks the drawing inside that area.
+  const viewWidth = boxWidth * 1.02;
+  const viewHeight = boxHeight * 1.02;
+  const viewX = boxX - boxWidth * 0.01;
+  const viewY = boxY - boxHeight * 0.01;
 
   let rasterWidth = Math.round(clamp(width * RASTER_SCALE, 240, 1600));
   let rasterHeight = Math.round((rasterWidth * viewHeight) / viewWidth);
@@ -654,10 +790,11 @@ function inkBounds(context: RasterContext, width: number, height: number): InkBo
 /**
  * Turns the answer into the picture that is drawn on the slide.
  *
- * The drawing is rasterised, its ink is measured and cropped out, and that ink
- * is fitted to the area the layout reserved: the figure fills its box whatever
- * coordinate space the model chose, and an answer that came out blank is
- * rejected here instead of being pasted on the slide as an empty rectangle.
+ * The drawing is rasterised and its ink is measured, so an answer that came out
+ * blank or microscopic is rejected here instead of being pasted on the slide as
+ * an empty rectangle. The whole frame is then fitted to the area the layout
+ * reserved: the model's composition — position, proportions, empty space — is
+ * kept, whatever coordinate space it chose to draw in.
  */
 async function rasterise(
   canvas: CanvasModule,
@@ -704,16 +841,20 @@ async function rasterise(
   const fittedContext = fitted.getContext("2d") as RasterContext;
   fittedContext.imageSmoothingEnabled = true;
 
-  const ratio = Math.min(fitted.width / ink.width, fitted.height / ink.height);
-  const drawWidth = ink.width * ratio;
-  const drawHeight = ink.height * ratio;
+  // The whole frame is fitted, not the ink alone: an element that sits on the
+  // left of its area with empty space on the right must stay there. Cutting
+  // the ink out and centring it turned a table with a wide margin into a
+  // full-width table, which is exactly what the critic then rejected.
+  //
+  // The fit preserves the drawing's own aspect ratio. The prompt asks for a
+  // canvas of exactly the size it is given, and it normally gets one; when it
+  // does not, a letterbox is honest and a stretch is not.
+  const ratio = Math.min(fitted.width / raster.width, fitted.height / raster.height);
+  const drawWidth = raster.width * ratio;
+  const drawHeight = raster.height * ratio;
 
   fittedContext.drawImage(
     raster,
-    ink.x,
-    ink.y,
-    ink.width,
-    ink.height,
     (fitted.width - drawWidth) / 2,
     (fitted.height - drawHeight) / 2,
     drawWidth,
@@ -877,12 +1018,22 @@ interface FigureVerdict {
  * drawing is kept rather than thrown away on the strength of a failed call.
  */
 async function critiqueFigure(
+  canvas: CanvasModule,
   figure: SlideFigure,
   rect: SlideRect,
   crop: string,
   drawing: RasterCanvas,
   round: number,
 ): Promise<FigureVerdict | null> {
+  const [origin, copy] = await Promise.all([
+    pairImage(canvas, crop, PAIR_WIDTH),
+    pairImage(canvas, drawing, PAIR_WIDTH),
+  ]);
+
+  // Without both pictures at the same size there is nothing to compare: the
+  // drawing is kept and the review is skipped rather than made up.
+  if (!origin || !copy) return null;
+
   const answer = await ask({
     model: VISION_MODEL,
     system: CRITIC_SYSTEM_PROMPT,
@@ -894,9 +1045,9 @@ async function critiqueFigure(
     parts: [
       { type: "text", text: buildCritiquePrompt(figure, Math.round(rect.width), Math.round(rect.height), round) },
       { type: "text", text: "IMAGE 1 — the element on the original slide:" },
-      { type: "image_url", image_url: { url: crop } },
+      { type: "image_url", image_url: { url: origin } },
       { type: "text", text: "IMAGE 2 — the drawing you are judging:" },
-      { type: "image_url", image_url: { url: await toDataUrl(drawing, PAIR_WIDTH) } },
+      { type: "image_url", image_url: { url: copy } },
     ],
   });
 
@@ -982,7 +1133,10 @@ async function recreate(
       ? await readBrief(figure, title, rect, crop)
       : null;
 
-  let best: { picture: RasterCanvas; score: number } | null = null;
+  // The document's own strings, when the figure has one: a drawing that drops
+  // them is rejected even if the art director liked the picture.
+  const expected = figure.verbatim && figure.verbatim.length > 0 ? figure.verbatim : [];
+  let best: { picture: RasterCanvas; score: number; missing: number } | null = null;
   let repair = handed;
   const rounds = brief ? MAX_DRAW_ROUNDS : VISION_ATTEMPTS;
   let round = 0;
@@ -1008,6 +1162,13 @@ async function recreate(
     );
     if (!svg) continue;
 
+    const missing = expected.length > 0 ? missingTexts(svg, expected) : [];
+    if (missing.length > 0) {
+      console.warn(
+        `Figure ${figure.id} round ${round} dropped ${missing.length} text(s) from the document: ${missing.join(" | ")}.`,
+      );
+    }
+
     const picture = await rasterise(canvas, figure, svg, rect);
     if (!picture) continue;
 
@@ -1015,25 +1176,48 @@ async function recreate(
     // for a verdict the drawing is simply taken.
     if (!crop || Date.now() + CRITIC_RESERVE_MS >= deadline) return picture;
 
-    const verdict = await critiqueFigure(figure, rect, crop, picture, round);
+    const verdict = await critiqueFigure(canvas, figure, rect, crop, picture, round);
     if (!verdict) return picture;
 
-    if (!best || verdict.score > best.score) best = { picture, score: verdict.score };
+    // A drawing that keeps the document's texts is always preferred over one
+    // that scores a little higher but silently lost a cell.
+    const candidate = { picture, score: verdict.score, missing: missing.length };
+    if (
+      !best ||
+      candidate.missing < best.missing ||
+      (candidate.missing === best.missing && candidate.score > best.score)
+    ) {
+      best = candidate;
+    }
 
-    if (verdict.score >= ACCEPT_SCORE && verdict.problems.length === 0) return picture;
+    if (verdict.score >= ACCEPT_SCORE && verdict.problems.length === 0 && missing.length === 0) {
+      return picture;
+    }
 
     console.warn(
       `Figure ${figure.id} round ${round} sent back (${verdict.score}/10): ${
-        verdict.problems.join(" ") || "no detail"
+        verdict.problems.join(" ") || (missing.length > 0 ? "texts missing" : "no detail")
       }`,
     );
 
+    const problems = [
+      ...verdict.problems,
+      ...(missing.length > 0
+        ? [
+            `The drawing is missing these texts from the document: ${missing
+              .map((text) => JSON.stringify(text))
+              .join(", ")}.`,
+          ]
+        : []),
+    ].slice(0, 4);
+
     repair = {
       problems:
-        verdict.problems.length > 0
-          ? verdict.problems
-          : ["The drawing does not match the original closely enough."],
+        problems.length > 0 ? problems : ["The drawing does not match the original closely enough."],
       instructions: verdict.instructions,
+      // The verdict was about this document: quoting it back turns the next
+      // round into a correction instead of a fresh guess.
+      ...(svg.length <= MAX_PREVIOUS_SVG_CHARS ? { previous: svg } : {}),
     };
   }
 
@@ -1215,10 +1399,28 @@ const cache = new Map<string, Promise<RasterCanvas | null>>();
  * different picture from the one it replaces, and must not be served from the
  * cache of the drawing that was rejected.
  */
-function cacheKey(figure: SlideFigure, rect: SlideRect, repair: FigureRepair | null): string {
+function fingerprint(value: string): string {
+  let hash = 2166136261;
+
+  for (let index = 0; index < value.length; index += 1) {
+    hash ^= value.charCodeAt(index);
+    hash = Math.imul(hash, 16777619);
+  }
+
+  return `${value.length.toString(36)}-${(hash >>> 0).toString(36)}`;
+}
+
+function cacheKey(
+  figure: SlideFigure,
+  rect: SlideRect,
+  repair: FigureRepair | null,
+  crop: string | null,
+): string {
   return [
     figure.id,
-    figure.description.length,
+    // A length is not an identity: two elements of two documents can easily
+    // share it, and then one is served the other's drawing.
+    fingerprint(`${figure.description}\n${figureTexts(figure).join("\n")}`),
     Math.round(figure.box.left * 1000),
     Math.round(figure.box.top * 1000),
     Math.round(figure.box.width * 1000),
@@ -1227,8 +1429,11 @@ function cacheKey(figure: SlideFigure, rect: SlideRect, repair: FigureRepair | n
     Math.round(rect.y),
     Math.round(rect.width),
     Math.round(rect.height),
+    fingerprint(crop ?? ""),
     repair
-      ? `r:${repair.problems.join("|").slice(0, 120)}:${repair.instructions.slice(0, 120)}`
+      ? `r:${repair.problems.join("|").slice(0, 120)}:${repair.instructions.slice(0, 120)}:${
+          repair.previous ? fingerprint(repair.previous) : ""
+        }`
       : "",
   ].join(":");
 }
@@ -1256,15 +1461,57 @@ export interface FigureArtworkOptions {
    * one is drawn again from the verdict instead of being served from the cache.
    */
   repairs?: Map<string, FigureRepair>;
+  /**
+   * High-resolution picture of each figure, keyed by figure id, rendered from
+   * the document during the analysis. Without one, the figure is cut out of the
+   * slide thumbnail, where a table is a handful of unreadable pixels.
+   */
+  crops?: Record<string, string>;
+}
+
+/**
+ * The original element, used when the model could not draw it.
+ *
+ * It is not a redrawing, but it is the truth: the crop comes from the document
+ * itself, and a readable piece of the source slide is worth more than the empty
+ * panel a failed drawing would leave.
+ */
+export async function cropPicture(
+  canvas: CanvasModule,
+  crop: string,
+  rect: SlideRect,
+): Promise<RasterCanvas | null> {
+  try {
+    const base64 = crop.replace(/^data:[^,]*,/, "");
+    const image = await canvas.loadImage(Buffer.from(base64, "base64"));
+    const scale = Math.min(RASTER_SCALE, 1400 / Math.max(rect.width, 1));
+    const raster = canvas.createCanvas(
+      Math.max(1, Math.round(rect.width * scale)),
+      Math.max(1, Math.round(rect.height * scale)),
+    );
+    const context = raster.getContext("2d") as RasterContext;
+
+    context.fillStyle = "#ffffff";
+    context.fillRect(0, 0, raster.width, raster.height);
+    context.imageSmoothingEnabled = true;
+    context.drawImage(image, 0, 0, raster.width, raster.height);
+
+    return raster;
+  } catch (error) {
+    console.warn(
+      `Crop fallback failed (${error instanceof Error ? error.message : "unknown error"}).`,
+    );
+    return null;
+  }
 }
 
 /**
  * Draws every figure of one slide and returns the pictures that made it.
  *
  * Figures are drawn a few at a time, because the models are the slow part of a
- * rebuild and the slides are painted one after the other. A figure that ends up
- * without a picture is simply absent from the map: the layout draws a labelled
- * panel in its place instead of leaving a hole.
+ * rebuild and the slides are painted one after the other. A figure whose
+ * drawing failed falls back to its own crop, so the element is on the slide
+ * whatever the models answered.
  */
 export async function figureArtwork(
   placed: PlacedFigure[],
@@ -1285,19 +1532,44 @@ export async function figureArtwork(
     const drawn = await Promise.all(
       batch.map(async ({ figure, rect }) => {
         const repair = options.repairs?.get(figure.id) ?? null;
-        const key = cacheKey(figure, rect, repair);
+        // The element on the original slide, not the placed rect: `rect` lives
+        // inside the template's frame and would crop the picture off by its
+        // margins.
+        const sourceRect = figureSourceRect(figure);
+        const crop =
+          options.crops?.[figure.id] ??
+          (painter ? await cropToDataUrl(canvas, painter, sourceRect) : null);
+        const key = cacheKey(figure, rect, repair, crop);
         const cached = cache.get(key);
-        if (cached) return { id: figure.id, picture: await cached };
+        let picture: RasterCanvas | null;
 
-        const job = (async () => {
-          const crop = painter ? await cropToDataUrl(canvas, painter, rect) : null;
+        if (cached) {
+          picture = await cached;
+        } else {
+          // Anything that goes wrong while drawing is a missing drawing, not a
+          // failed rebuild: the figure falls back to its crop like the others.
+          const job = recreate(canvas, figure, rect, crop, title, deadline, repair).catch(
+            (error: unknown) => {
+              console.warn(
+                `Figure ${figure.id} could not be drawn (${
+                  error instanceof Error ? error.message : "unknown error"
+                }); falling back to its crop.`,
+              );
 
-          return recreate(canvas, figure, rect, crop, title, deadline, repair);
-        })();
+              return null;
+            },
+          );
 
-        remember(key, job);
+          remember(key, job);
+          picture = await job;
+        }
 
-        return { id: figure.id, picture: await job };
+        return {
+          id: figure.id,
+          // A drawing that never arrived would leave the element empty: the
+          // crop is the document's own picture and it is always there.
+          picture: picture ?? (crop ? await cropPicture(canvas, crop, rect) : null),
+        };
       }),
     );
 

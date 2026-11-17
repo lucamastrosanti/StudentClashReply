@@ -6,6 +6,7 @@ import Markdown from "react-markdown";
 import remarkGfm from "remark-gfm";
 
 import { LayoutSummaryPanel } from "@/components/LayoutSummaryPanel";
+import { showFormulas } from "@/lib/slidePreview";
 import type { SlideFigure } from "@/lib/slideFigures";
 import type {
   GeneratedSlide,
@@ -64,6 +65,12 @@ export function SlideBreakdown({
   const count = Math.max(total, ordered.length);
   const peeked = peekIndex !== null ? generatedByIndex.get(peekIndex) : undefined;
   const selectedRebuild = selected ? generatedByIndex.get(selected.index) : undefined;
+  // Formulas are shown as code, so the panel keeps the LaTeX the model wrote
+  // without the dollar signs running through the prose.
+  const transcription = useMemo(
+    () => (selected ? showFormulas(selected.markdown) : ""),
+    [selected],
+  );
 
   const startPeek = (index: number) => (event: React.PointerEvent<HTMLButtonElement>) => {
     event.preventDefault();
@@ -338,7 +345,7 @@ export function SlideBreakdown({
                 ),
               }}
             >
-              {selected.markdown}
+              {transcription}
             </Markdown>
           ) : (
             <p className="text-sm text-slate-500">
@@ -367,7 +374,7 @@ export function SlideBreakdown({
               <span>
                 Rebuilt slide {peeked.index}
                 {peeked.figures > 0
-                  ? ` · ${peeked.figures} ${peeked.figures === 1 ? "figure" : "figures"} redrawn`
+                  ? ` · ${peeked.figures} ${peeked.figures === 1 ? "figure" : "figures"} on the slide`
                   : ""}
                 {peeked.clipped ? " · dense content trimmed to fit" : ""}
                 {peeked.review

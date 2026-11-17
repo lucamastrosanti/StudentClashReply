@@ -53,9 +53,9 @@ uploads always work.
    processed until you ask for it.
 2. **Analyze** one material: `POST /api/analyze` streams newline-delimited JSON.
 3. **Read** the breakdown: slide thumbnails on the left, the transcription of
-   the selected slide on the right, slide by slide as it arrives. Each slide
-   also lists what was kept out of its Markdown and the pictures that will be
-   redrawn.
+   the selected slide on the right, slide by slide as it arrives, with the
+   formulas kept as their LaTeX. Each slide also lists what was kept out of its
+   Markdown and the pictures that will be redrawn.
 4. **Check the layout summary** above the breakdown: it merges the furniture
    found on every slide, counts the repetitions and marks sequential elements
    such as page numbers.
@@ -86,8 +86,9 @@ temperature) before that slide is reported as failed.
 | Stage | Module | What happens |
 | --- | --- | --- |
 | Request | `lib/rebuildPayload.ts` | The browser posts the Markdown it already has — never the document — plus the pictures of each slide and one JPEG of the original slide. Slides without a transcription are skipped and reported. |
-| Parse | `lib/slideMarkdown.ts` | The transcription becomes a block model: title, sections, lists, code, tables, quotes; LaTeX formulas become readable Unicode. |
-| Figures | `lib/slideFigureGen.ts` | Every picture is cropped out of the original slide and scaled up, then drawn by a rolling review: `deepseek-flash` looks at the crop and writes a precise brief (shapes, positions, colours, texts), `deepseek-v4-pro` turns that brief plus the crop into SVG at the size of the reserved rectangle, and a second look with both pictures side by side scores the drawing 0-10 and lists what is wrong. A drawing below 7 is sent back with that list and drawn again — at most two repairs, while the clock allows — and the best-scoring attempt is the one that is kept. The answer is cleaned, rasterised at twice its size, measured — the ink is cropped out of the canvas and fitted to the rectangle — and cached by content; two figures are drawn at a time, an answer that comes out empty is retried, and the vision model alone is the fallback when the figure budget runs out. |
+| Parse | `lib/slideMarkdown.ts` | The transcription becomes a block model: title, sections, lists, code, tables, quotes, and formulas — display math as its own block, inline math as its own run. |
+| Math | `lib/slideMath.ts` | The LaTeX is typeset on the canvas as real mathematics, not flattened to Unicode: a parser builds the expression tree and the layout stacks fractions, roots, sums and integrals with their limits, matrices, delimiters and scripts, then draws it with the template's own face. Digits and operator names stay upright inside italic formulas, inline formulas sit on the baseline of the sentence around them, and a display formula that is too wide steps down until it fits instead of running off the frame. |
+| Figures | `lib/slideFigureGen.ts` | Every picture is cropped out of the original slide and scaled up, then drawn by a rolling review: `deepseek-flash` looks at the crop and writes a precise brief (shapes, positions, colours, texts), `deepseek-v4-pro` turns that brief plus the crop into SVG at the size of the reserved rectangle, and a second look with both pictures side by side scores the drawing 0-10 and lists what is wrong. A drawing below 7 is sent back with that list and drawn again — at most two repairs, while the clock allows — and the best-scoring attempt is the one that is kept. The answer is cleaned, rasterised at twice its size, measured — the ink is cropped out of the canvas and fitted to the rectangle — and cached by content; two figures are drawn at a time, an answer that comes out empty is retried, and the vision model alone is the fallback when the figure budget runs out. A figure the models never drew — an unusable answer after the retries, or a failure inside the drawing itself — is replaced by its own crop fitted to the rectangle, so no element is left empty. |
 | Plan | `lib/slideLayout.ts` | The picture rectangles are reserved first, then the title and the sections are set in the largest free band — two columns when one is not enough — while the type size steps down until everything fits. A block that still does not fit is dropped whole (replaced by an ellipsis) instead of being cut in half; if pictures are what leaves too little room, they shrink a little and the text is planned again. |
 | Draw | `lib/slideTheme.ts` | The template artwork is vector, not a bitmap: four corner clusters in three blues plus one warm accent. Nothing is painted inside the text frame. |
 | Encode | `lib/slideRender.ts` | One canvas at 1920×1080, then a JPEG: 1280 px for the preview, full size for the PDF. Once the page is painted, `deepseek-flash` compares it with the original slide: `ok`, a score, and up to four issues. A figure it names is drawn once more with the issue as the verdict and the page is painted again; text and layout issues cannot be rewritten here and are reported with the slide instead. |
@@ -107,9 +108,11 @@ that only looks wrong next to the text can still be redrawn. Both judgements are
 fail-open — a reviewer that times out, refuses or answers nonsense leaves the
 drawing that exists — and both are skipped when the slice is too short to act on
 what they say. A picture that no model could draw (an unusable answer after the
-retries, or no model at all) falls back to a labelled panel with its description,
-and is not counted among the redrawn ones. The PDF pages are raster, so their
-text is not selectable.
+retries, or a drawing that failed outright) goes back as its own crop of the
+original slide, fitted to the same rectangle: the element is on the slide either
+way, and the drawing is only a redrawing of what the crop already shows. Only a
+figure with no crop to fall back to becomes a labelled panel with its
+description. The PDF pages are raster, so their text is not selectable.
 
 The artwork lives only in `lib/slideTheme.ts`: replacing it with the final design
 means changing `drawSlideBackground` and nothing else.
@@ -181,9 +184,9 @@ picture — that text belongs to the picture, which is redrawn with it inside.
   enough, whole blocks are dropped and the preview says the content was trimmed.
 - Redrawn pictures are the model's own drawing of the crop: shapes and colours
   follow the original, while small print inside a chart (axis labels, legends)
-  can be simplified or left out. A picture that could not be drawn keeps a
-  labelled panel with its description, and the preview counts only the ones that
-  were actually redrawn.
+  can be simplified or left out. A picture that could not be drawn keeps its own
+  crop of the original slide, so the element is always there; the count in the
+  preview is how many figures the slide ended up with.
 - The rebuilt slide is posted with its pictures and one JPEG of the original
   slide: a very dense deck makes that request large. Slides above 60 per file are
   still refused before any of this.

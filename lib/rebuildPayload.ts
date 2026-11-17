@@ -13,6 +13,10 @@ export const MAX_REBUILD_SLIDES = 60;
 const MAX_MARKDOWN_CHARS = 200_000;
 /** A slide thumbnail at rail size: well under this. */
 const MAX_SOURCE_CHARS = 1_600_000;
+/** One figure rendered at 1200 px is a few hundred kilobytes at most. */
+const MAX_CROP_CHARS = 1_600_000;
+/** Bound on what one slide's figures may add to the request. */
+const MAX_CROPS_CHARS = 3_000_000;
 
 const DATA_URL = /^data:image\/(?:jpeg|jpg|png|webp);base64,[A-Za-z0-9+/=\r\n]+$/;
 
@@ -61,6 +65,7 @@ export function parseRebuildPayload(value: unknown): RebuildParse {
       index?: unknown;
       markdown?: unknown;
       figures?: unknown;
+      figureCrops?: unknown;
       source?: unknown;
     };
     if (
@@ -81,10 +86,13 @@ export function parseRebuildPayload(value: unknown): RebuildParse {
     seen.add(slide.index);
 
     if (hasSlideContent(slide.markdown)) {
+      const figures = normalizeFigures(slide.figures);
+
       slides.push({
         index: slide.index,
         markdown: slide.markdown,
-        figures: normalizeFigures(slide.figures),
+        figures,
+        figureCrops: readCrops(slide.figureCrops, figures.map((figure) => figure.id)),
         source: readSource(slide.source),
       });
     } else {
@@ -121,6 +129,36 @@ function readSource(value: unknown): string | undefined {
   if (value.length > MAX_SOURCE_CHARS) return undefined;
 
   return DATA_URL.test(value.trim()) ? value.trim() : undefined;
+}
+
+/**
+ * The pictures of the single figures, keyed by figure id.
+ *
+ * Only the ids that survived `normalizeFigures` are kept: a crop whose figure
+ * is gone is a picture of something that will not be drawn. The budget is per
+ * slide, so one enormous figure cannot push every other slide out of the
+ * request.
+ */
+function readCrops(value: unknown, figureIds: string[]): Record<string, string> | undefined {
+  if (typeof value !== "object" || value === null || Array.isArray(value)) return undefined;
+
+  const allowed = new Set(figureIds);
+  const crops: Record<string, string> = {};
+  let total = 0;
+
+  for (const [id, raw] of Object.entries(value as Record<string, unknown>)) {
+    if (!allowed.has(id)) continue;
+    if (typeof raw !== "string") continue;
+
+    const crop = raw.trim();
+    if (crop.length > MAX_CROP_CHARS || !DATA_URL.test(crop)) continue;
+    if (total + crop.length > MAX_CROPS_CHARS) break;
+
+    crops[id] = crop;
+    total += crop.length;
+  }
+
+  return Object.keys(crops).length > 0 ? crops : undefined;
 }
 
 /** `report.pptx` → `report-rebuilt.pdf`; ASCII only, header-safe. */

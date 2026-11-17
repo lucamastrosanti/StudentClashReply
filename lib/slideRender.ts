@@ -4,7 +4,13 @@ import type { FigureRepair } from "./slideFigureGen";
 import { canRepairFigures, figureArtwork, figureRepairs, reviewSlide } from "./slideFigureGen";
 import type { SlideFigure, SlideReview } from "./slideFigures";
 import type { PlacedFigure } from "./slideLayout";
-import { drawLayout, placeFigures, planSlide, TIGHT_FIGURE_BUDGET } from "./slideLayout";
+import {
+  contentTopFor,
+  drawLayout,
+  placeFigures,
+  planSlide,
+  TIGHT_FIGURE_BUDGET,
+} from "./slideLayout";
 import {
   drawSlideBackground,
   resolveFonts,
@@ -49,7 +55,7 @@ export interface RenderedSlide {
   height: number;
   /** Content blocks laid out on the slide. */
   blocks: number;
-  /** Figures redrawn from the original slide and placed on it. */
+  /** Figures placed on the slide, drawn by the models or kept as their own crop. */
   figures: number;
   /** True when even the smallest type did not make the content fit. */
   clipped: boolean;
@@ -68,6 +74,11 @@ export interface RenderOptions {
   figures?: SlideFigure[];
   /** Picture of the original slide, the reference the figures are redrawn from. */
   source?: string;
+  /**
+   * High-resolution picture of each figure, keyed by figure id, produced during
+   * the analysis by rendering the element from the document itself.
+   */
+  crops?: Record<string, string>;
   /** Figures the judge sent back, with what has to change. */
   repairs?: Map<string, FigureRepair>;
   /**
@@ -80,7 +91,7 @@ export interface RenderOptions {
 /** Paints the template, the figures and the content; returns the full-size raster. */
 export async function paintSlide(
   markdown: string,
-  options: Pick<RenderOptions, "index" | "figures" | "source" | "deadline" | "repairs">,
+  options: Pick<RenderOptions, "index" | "figures" | "source" | "crops" | "deadline" | "repairs">,
 ): Promise<{
   raster: RasterCanvas;
   model: SlideModel;
@@ -101,7 +112,9 @@ export async function paintSlide(
 
   const model = parseSlideMarkdown(markdown);
   const requested = options.figures ?? [];
-  const placed = placeFigures(requested);
+  // The title block is the same on every slide, so the pictures start below it.
+  const topLimit = contentTopFor(context, model, `Slide ${options.index}`);
+  const placed = placeFigures(requested, undefined, topLimit);
   const title = model.title
     .map((run) => run.text)
     .join(" ")
@@ -112,6 +125,7 @@ export async function paintSlide(
   // keep, so a picture on the left pushes the transcription to the right.
   const artwork = await figureArtwork(placed, options.source, {
     title,
+    crops: options.crops,
     deadline: options.deadline,
     repairs: options.repairs,
   });
@@ -125,7 +139,7 @@ export async function paintSlide(
   // Dense text wins over big pictures: the figures stay where they were but
   // take less room, so the transcription keeps every line instead of being cut.
   if (layout.clipped && figures.length > 0) {
-    const tighter = withArtwork(placeFigures(requested, TIGHT_FIGURE_BUDGET));
+    const tighter = withArtwork(placeFigures(requested, TIGHT_FIGURE_BUDGET, topLimit));
     const retry = planSlide(context, model, `Slide ${options.index}`, tighter);
 
     if (!retry.clipped) {

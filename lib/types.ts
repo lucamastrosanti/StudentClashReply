@@ -34,6 +34,12 @@ export interface SlideAnalysis {
   markdown: string;
   /** Visual elements to recreate and place on the rebuilt slide. */
   figures: SlideFigure[];
+  /**
+   * One high-resolution JPEG (data URL) per figure, keyed by figure id, rendered
+   * from the document itself. A figure is a small part of the page raster, so
+   * cropping it from the thumbnail would leave its text unreadable.
+   */
+  figureCrops?: Record<string, string>;
   /** Page furniture found on this slide and kept out of `markdown`. */
   layout: SlideLayoutElement[];
   /** False when the model could not describe this slide. */
@@ -137,6 +143,8 @@ export interface RebuildSlideInput {
   markdown: string;
   /** Visual elements of the original slide, with the area each one occupied. */
   figures?: SlideFigure[];
+  /** High-resolution JPEG per figure, keyed by figure id. */
+  figureCrops?: Record<string, string>;
   /** Compact JPEG data URL of the original slide, the reference for the figures. */
   source?: string;
 }

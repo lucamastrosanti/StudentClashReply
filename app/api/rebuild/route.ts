@@ -83,6 +83,7 @@ export async function POST(request: NextRequest) {
             width: PREVIEW_WIDTH,
             quality: PREVIEW_QUALITY,
             figures: slide.figures,
+            crops: slide.figureCrops,
             source: slide.source,
             deadline: slideDeadline(figuresDeadline, slides.length - offset),
           });

@@ -295,71 +295,86 @@ export default function Home() {
       }));
 
       try {
-        const response = await fetch("/api/rebuild", {
-          method: "POST",
-          headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({
-            fileName: target.file.name,
-            slides: transcribed.map(({ index, markdown, figures, thumbnail }) => ({
-              index,
-              markdown,
-              figures,
-              source: thumbnail,
-            })),
-          }),
-        });
-
-        if (!response.ok || !response.body) {
-          const payload = (await response.json().catch(() => null)) as { error?: string } | null;
-          throw new Error(
-            payload?.error ?? `The server rejected the request (HTTP ${response.status}).`,
-          );
-        }
-
-        let settled = false;
-
-        await readStream<RebuildStreamEvent>(response.body, (event) => {
-          if (event.type === "progress") {
-            mergeGeneration(id, () => ({
-              status: "processing",
-              progress: event.value,
-              message: event.message,
-            }));
-            return;
-          }
-
-          if (event.type === "slide") {
-            mergeGeneration(id, (current) => ({
-              status: "processing",
-              slides: [...current.slides.filter((slide) => slide.index !== event.slide.index), event.slide].sort(
-                (left, right) => left.index - right.index,
-              ),
-            }));
-            return;
-          }
-
-          settled = true;
-
-          if (event.type === "done") {
-            mergeGeneration(id, () => ({
-              status: "done",
-              progress: 100,
-              message: event.message,
-              skipped: event.skipped,
-              error: undefined,
-            }));
-            return;
-          }
-
-          mergeGeneration(id, () => ({ status: "error", error: event.message }));
-        });
-
-        if (!settled) {
+        // One request per slide. The figures of a slide are drawn, judged and
+        // repaired inside a single request, and the request has the whole
+        // function budget for that one slide instead of a fair share of the
+        // deck's: a hard figure is no longer a first draft nobody had time to
+        // review because seven other slides were queued behind it.
+        for (const [offset, slide] of transcribed.entries()) {
           mergeGeneration(id, () => ({
-            status: "error",
-            error: "The connection closed before the last slide was rebuilt. Please try again.",
+            status: "processing",
+            message: `Rebuilding slide ${offset + 1} of ${transcribed.length}…`,
+          }));
+
+          const response = await fetch("/api/rebuild", {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({
+              fileName: target.file.name,
+              slides: [
+                {
+                  index: slide.index,
+                  markdown: slide.markdown,
+                  figures: slide.figures,
+                  figureCrops: slide.figureCrops,
+                  source: slide.thumbnail,
+                },
+              ],
+            }),
+          });
+
+          if (!response.ok || !response.body) {
+            const payload = (await response.json().catch(() => null)) as { error?: string } | null;
+            throw new Error(
+              payload?.error ?? `The server rejected the request (HTTP ${response.status}).`,
+            );
+          }
+
+          let rebuilt = false;
+          let failure: string | null = null;
+
+          await readStream<RebuildStreamEvent>(response.body, (event) => {
+            if (event.type === "slide") {
+              rebuilt = true;
+              mergeGeneration(id, (current) => ({
+                status: "processing",
+                slides: [
+                  ...current.slides.filter((entry) => entry.index !== event.slide.index),
+                  event.slide,
+                ].sort((left, right) => left.index - right.index),
+              }));
+              return;
+            }
+
+            if (event.type === "error") {
+              failure = event.message;
+              return;
+            }
+
+            if (event.type === "done") rebuilt = true;
+          });
+
+          if (failure) throw new Error(failure);
+          if (!rebuilt) {
+            throw new Error(`Slide ${slide.index} was not rebuilt. Please try again.`);
+          }
+
+          mergeGeneration(id, () => ({
+            status: "processing",
+            progress: Math.round(((offset + 1) / transcribed.length) * 100),
+            message: `Slide ${offset + 1} of ${transcribed.length} rebuilt.`,
           }));
         }
+
+        mergeGeneration(id, () => ({
+          status: "done",
+          progress: 100,
+          message:
+            transcribed.length === 1
+              ? "Slide rebuilt."
+              : `${transcribed.length} slides rebuilt on the template.`,
+          error: undefined,
+        }));
       } catch (failure) {
         mergeGeneration(id, () => ({
           status: "error",
@@ -390,10 +405,11 @@ export default function Home() {
           headers: { "Content-Type": "application/json" },
           body: JSON.stringify({
             fileName: target.file.name,
-            slides: selected.map(({ index, markdown, figures, thumbnail }) => ({
+            slides: selected.map(({ index, markdown, figures, figureCrops, thumbnail }) => ({
               index,
               markdown,
               figures,
+              figureCrops,
               source: thumbnail,
             })),
           }),

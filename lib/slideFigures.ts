@@ -30,8 +30,21 @@ export interface SlideFigure {
   description: string;
   /** Texts printed inside the element, in reading order. */
   labels: string[];
+  /**
+   * The same texts read from the document's own text layer, when it had one.
+   *
+   * `labels` is a model's transcription of what it saw; this is the document
+   * speaking. It is used instead of `labels` for everything that is redrawn or
+   * checked, so a table cell is never guessed.
+   */
+  verbatim?: string[];
   /** Dominant colours the element uses, as `#rrggbb`. */
   palette: string[];
+}
+
+/** The texts that must appear in a redrawing: the document's, when known. */
+export function figureTexts(figure: SlideFigure): string[] {
+  return figure.verbatim && figure.verbatim.length > 0 ? figure.verbatim : figure.labels;
 }
 
 /* -------------------------------------------------------------------------- */
@@ -73,6 +86,52 @@ export interface SlideRect {
 
 /** At most this many visual elements are recreated per slide. */
 export const MAX_FIGURES = 6;
+
+/**
+ * Room kept around a reported box, as a fraction of the box itself.
+ *
+ * The analysis gives the area of an element from looking at the slide, and it
+ * is a little tight: the left edge of a table or the title bar of a panel can
+ * fall just outside it. The box is widened before anything is cropped, so the
+ * picture sent to the model, the area reserved on the rebuilt slide and the
+ * picture the critic compares all show the same thing.
+ */
+export const FIGURE_BOX_MARGIN = 0.03;
+
+/** The same box, with `margin` of its own size added on every side. */
+export function expandBox(box: FigureBox, margin: number = FIGURE_BOX_MARGIN): FigureBox {
+  const padX = box.width * margin;
+  const padY = box.height * margin;
+  const left = Math.max(0, box.left - padX);
+  const top = Math.max(0, box.top - padY);
+  const right = Math.min(1, box.left + box.width + padX);
+  const bottom = Math.min(1, box.top + box.height + padY);
+
+  return { left, top, width: right - left, height: bottom - top };
+}
+
+/** The same box, with `margin` of the whole slide added on every side. */
+export function inflateBox(box: FigureBox, margin: number): FigureBox {
+  const left = Math.max(0, box.left - margin);
+  const top = Math.max(0, box.top - margin);
+
+  return {
+    left,
+    top,
+    width: Math.min(1, box.left + box.width + margin) - left,
+    height: Math.min(1, box.top + box.height + margin) - top,
+  };
+}
+
+/** The smallest box that contains both. */
+export function unionBoxes(first: FigureBox, second: FigureBox): FigureBox {
+  const left = Math.min(first.left, second.left);
+  const top = Math.min(first.top, second.top);
+  const right = Math.max(first.left + first.width, second.left + second.width);
+  const bottom = Math.max(first.top + first.height, second.top + second.height);
+
+  return { left, top, width: right - left, height: bottom - top };
+}
 
 /** A box smaller than this is not a figure: it is noise in the model answer. */
 const MIN_BOX_SIDE = 0.06;
@@ -233,6 +292,23 @@ function normalizeLabels(value: unknown): string[] {
   return labels;
 }
 
+/** The document's own texts: longer than a model's labels, and not guessed. */
+function normalizeVerbatim(value: unknown): string[] {
+  if (!Array.isArray(value)) return [];
+
+  const texts: string[] = [];
+  for (const entry of value) {
+    if (typeof entry !== "string") continue;
+
+    const text = entry.replace(/\s+/g, " ").trim().slice(0, 180);
+    if (!text || !/[\p{L}\p{N}]/u.test(text)) continue;
+    if (!texts.includes(text)) texts.push(text);
+    if (texts.length >= 40) break;
+  }
+
+  return texts;
+}
+
 function normalizePalette(value: unknown): string[] {
   const raw = Array.isArray(value)
     ? value
@@ -305,6 +381,7 @@ export function normalizeFigures(value: unknown): SlideFigure[] {
       box,
       description,
       labels: normalizeLabels(entry.labels ?? entry.texts),
+      verbatim: normalizeVerbatim(entry.verbatim),
       palette: normalizePalette(entry.palette ?? entry.colors),
     });
   });
